@@ -1,0 +1,11 @@
+{
+    "name": "homebridge-airconrc-plugin",
+    "version": "1.0.0",
+    "main": "index.js",
+    "keywords": [
+        "homebridge-plugin"
+    ],
+    "engines": {
+        "homebridge": ">=0.2.5"
+    }
+}
