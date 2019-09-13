@@ -1,12 +1,51 @@
-const aircon = require('./ac-plugins').plugin('zanussi');
-
 let Service, Characteristic;
+let inherits = require('util').inherits;
 
 const DEBUG = true;
 
 module.exports = function (homebridge) {
 	Service = homebridge.hap.Service;
 	Characteristic = homebridge.hap.Characteristic;
+
+	/**
+	* Set custom Characterisic & Service
+	* It is not recognize by Home.app, only by alternatives like Eve.app
+	* Characteristic "CurrentAirPressure"
+	*/
+
+	Characteristic.CurrentAirPressure = function() {
+	  Characteristic.call(this, 'CurrentAirPressure', '00000102-0000-1000-8000-0026BB765291');
+	  this.setProps({
+		unit: "mm",
+		minValue: 500,
+		maxValue: 1000,
+		format: Characteristic.Formats.FLOAT,
+		perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	  });
+	  this.value = this.getDefaultValue();
+	};
+
+	inherits(Characteristic.CurrentAirPressure, Characteristic);
+
+	Characteristic.CurrentAirPressure.UUID = '00000102-0000-1000-8000-0026BB765291';
+
+	/**
+	 * Service "Air Pressure Sensor"
+	 */
+
+	Service.AirPressureSensor = function(displayName, subtype) {
+	  Service.call(this, displayName, '00000101-0000-1000-8000-0026BB765291', subtype);
+
+	  // Required Characteristics
+	  this.addCharacteristic(Characteristic.CurrentAirPressure);
+
+	  // Optional Characteristics
+	  this.addOptionalCharacteristic(Characteristic.Name);
+	};
+
+	inherits(Service.AirPressureSensor, Service);
+
+	Service.AirPressureSensor.UUID = '00000101-0000-1000-8000-0026BB765291';
 
 	homebridge.registerAccessory("airconrc-plugin", "Aircon remote control", HeaterCoolerRemote);
 };
@@ -41,6 +80,8 @@ class HeaterCoolerRemote {
 				if(ability === 'airpressure') this.sensors.airpressure = plugin;
 			}
 		}
+
+		this.aircon = require('./ac-plugins').plugin('zanussi');
 
         this.cmdTimeout = config.cmdTimeout || 2000; // millisecond, async send timeout
         this.updateInterval = config.updateInterval || 2000; // millisecond, sync interval
@@ -186,9 +227,8 @@ class HeaterCoolerRemote {
 		}
 
 		if(this.sensors.airpressure) {
-			this.CurrentAirPressure = this.AirPressureService.getCharacteristic(Characteristic.CurrentAirPressure);
+			this.CurrentAirPressure = this.AirPressureService.getCharacteristic(Characteristic.CurrentAirPressure)
 		}
-
     }
 
     getServices() {
@@ -217,30 +257,24 @@ class HeaterCoolerRemote {
 				.catch(console.log);
 		}
 
-		if(this.sensors.eco2) {
+		if(this.sensors.eco2 || this.sensors.tvoc) {
 			this.CarbonDioxideDetected.updateValue(Characteristic.CarbonDioxideDetected.CO2_LEVELS_NORMAL);
 			this.CarbonDioxidePeakLevel.updateValue(0);
 			this.CarbonDioxideService.getCharacteristic(Characteristic.CarbonDioxideLevel)
 				.updateValue(this.CarbonDioxideLevel.value);
-			this.sensors.eco2.readECO2()
-				.then(data => this.CarbonDioxideLevel.updateValue(data))
-				.catch(console.log);
-		}
 
-		if(this.sensors.tvoc) {
-			this.sensors.tvoc.readTVOC()
-				.then(data => this.VOCDensity.updateValue(data))
-				.catch(console.log);
-		}
+			this.sensors.eco2.readSensorData()
+				.then(data => {
+					this.CarbonDioxideLevel.updateValue(data.eco2);
+					this.VOCDensity.updateValue(data.tvoc);
+				})
+				.catch(err => this.log.error(err.message));
 
-		if (this.sensors.eco2 || this.sensors.tvoc) {
 			const data = this._checkAirQuality();
 			this.AirQuality.updateValue(data);
 		}
 
-
 		if (this.sensors.airpressure) {
-			this.CurrentAirPressure.updateValue(900);
 			this.sensors.airpressure.readPressure()
 				.then(data => this.CurrentAirPressure.updateValue(data))
 				.catch(console.log);
@@ -254,11 +288,11 @@ class HeaterCoolerRemote {
 		this.HeatingThresholdTemperature.updateValue(this.targetTemperature - 1);
 
 		const mode = this._selectMode();
-		aircon.setTemp(this.targetTemperature);
-		if(mode === "COOL") aircon.setTemp(this.CoolingThresholdTemperature.value);
-		if(mode === "HEAT") aircon.setTemp(this.HeatingThresholdTemperature.value);
-		aircon.setMode(mode);
-		aircon.setFan(this.defaultRotationSpeed);
+		this.aircon.setTemp(this.targetTemperature);
+		if(mode === "COOL") this.aircon.setTemp(this.CoolingThresholdTemperature.value);
+		if(mode === "HEAT") this.aircon.setTemp(this.HeatingThresholdTemperature.value);
+		this.aircon.setMode(mode);
+		this.aircon.setFan(this.defaultRotationSpeed);
 
 	}
 
@@ -274,7 +308,7 @@ class HeaterCoolerRemote {
         	if(this.CarbonDioxideLevel.value > this.CarbonDioxidePeakLevel.value)
         		this.CarbonDioxidePeakLevel.updateValue(this.CarbonDioxideLevel.value);
 
-        	if(this.CarbonDioxideLevel.value > 1000)
+        	if(this.CarbonDioxideLevel.value > 2000)
         		this.CarbonDioxideDetected.updateValue(Characteristic.CarbonDioxideDetected.CO2_LEVELS_ABNORMAL);
         	else
         		this.CarbonDioxideDetected.updateValue(Characteristic.CarbonDioxideDetected.CO2_LEVELS_NORMAL);
@@ -302,22 +336,30 @@ class HeaterCoolerRemote {
 				.then(resolve)
 				.catch(reject);
 		});
-		let p3 = this.sensors.eco2 && new Promise((resolve, reject) => {
-			this.sensors.eco2.readECO2()
-				.then(data => this.CarbonDioxideLevel.updateValue(data))
+		let p3 = this.sensors.eco2 && this.sensors.tvoc && new Promise((resolve, reject) => {
+			this.sensors.eco2.readSensorData()
+				.then(data => {
+// 					console.log(data);
+					if(data > 3000) console.log("Warning!!! " + data);
+					if(400 < data < 3000) {
+						this.CarbonDioxideLevel.updateValue(data.eco2);
+						this.VOCDensity.updateValue(data.tvoc);
+					}
+					else this.log.error("WARNING! WRONG DATA" + data); //for debug
+				})
 				.then(resolve)
 				.catch(reject);
 		});
-		let p4 = this.sensors.tvoc && new Promise((resolve, reject) => {
-			this.sensors.tvoc.readTVOC()
-				.then(data => this.VOCDensity.updateValue(data))
+		let p4 = this.sensors.airpressure && new Promise((resolve,reject) => {
+			this.sensors.airpressure.readPressure()
+				.then(data => this.CurrentAirPressure.updateValue(data))
 				.then(resolve)
 				.catch(reject);
 		});
 
+
 		Promise.all([p1,p2,p3,p4])
 			.catch(err => this.log.error(err.message))
-// 			.catch(err => this.log(err))
 			.then(() => setTimeout(this.updateDash.bind(this), this.updateInterval));
 	}
 
@@ -343,15 +385,15 @@ class HeaterCoolerRemote {
 		else swing = "OFF";
 
 */
-    	if(!this.Active.value) aircon.turnOff();
+    	if(!this.Active.value) this.aircon.turnOff();
 
-    	aircon.sendWave();
+    	this.aircon.sendWave();
 
     }
 
 	_setActive(Active, callback) {
 
-		if(this.Active.value === Characteristic.Active.INACTIVE) aircon.turnOn();
+		if(this.Active.value === Characteristic.Active.INACTIVE) this.aircon.turnOn();
 
         callback();
 
@@ -394,7 +436,7 @@ class HeaterCoolerRemote {
 				break;
 		}
 
-    	aircon.setMode(mode);
+    	this.aircon.setMode(mode);
         this.sendCmdAsync();
 
     }
@@ -407,7 +449,7 @@ class HeaterCoolerRemote {
 
 //         if (this.CoolingThresholdTemperature.value !== CoolingThresholdTemperature.value) {
             this.targetTemperature = CoolingThresholdTemperature;
-            aircon.setTemp(this.targetTemperature);
+            this.aircon.setTemp(this.targetTemperature);
         	console.log('Cooling tres');
 //         }
 
@@ -423,7 +465,7 @@ class HeaterCoolerRemote {
 
 //         if (this.HeatingThresholdTemperature.value !== HeatingThresholdTemperature.value) {
             this.targetTemperature = HeatingThresholdTemperature;
-            aircon.setTemp(this.targetTemperature);
+            this.aircon.setTemp(this.targetTemperature);
         	console.log('Heating tres');
 //         }
 
@@ -442,7 +484,7 @@ class HeaterCoolerRemote {
 
     	if(this.SwingMode.value) swing = "SWING";
 		else swing = "OFF";
-		aircon.setSwing(swing);
+		this.aircon.setSwing(swing);
 
         this.sendCmdAsync();
     }
@@ -471,7 +513,7 @@ class HeaterCoolerRemote {
 
         this.debug('Calling setRotationSpeed to ' + fan);
 
-    	aircon.setFan(fan);
+    	this.aircon.setFan(fan);
         this.sendCmdAsync();
 	}
 
